@@ -14,11 +14,15 @@ A local network monitor for Linux. Scans your LAN, tracks devices over time, and
 - **Automatic monitoring** — scans every 30 seconds in the background
 - **Search and filters** — by IP, hostname, MAC or vendor; online/offline/new in 24h
 - **Export** — device list and event history to CSV or JSON
+- <img width="152" height="101" alt="изображение" src="https://github.com/user-attachments/assets/33706e38-30e2-407f-82de-84cada5741c6" />
+
 - **Notifications and tray** — desktop alerts, tray icon, quiet hours
 - **Dark and light themes**
 - **Start on login** (optional)
 - **One-file installer** — sets up system packages, Python environment, permissions and menu icon in one step
-- ### Custom Network Scanning (CIDR / VLAN)
+- **Custom Network Scanning (CIDR / VLAN)**
+- <img width="420" height="561" alt="изображение" src="https://github.com/user-attachments/assets/6145798c-34a9-4a9c-97b3-d84bf7208ec3" />
+
 - Added a **SCAN TARGET** field in Settings to manually specify a subnet (e.g., `10.0.20.0/24`) instead of relying solely on the default local network.
 - This allows scanning specific VLANs or multiple subnets available on the same physical interface.
 - **Security:** Strict IPv4 validation prevents option injection (e.g., `--file=/etc/passwd`) and size limits (max `/20`) prevent endless sweeps.
