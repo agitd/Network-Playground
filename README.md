@@ -18,6 +18,12 @@ A local network monitor for Linux. Scans your LAN, tracks devices over time, and
 - **Dark and light themes**
 - **Start on login** (optional)
 - **One-file installer** — sets up system packages, Python environment, permissions and menu icon in one step
+- **NEW**
+- ### Custom Network Scanning (CIDR / VLAN)
+- Added a **SCAN TARGET** field in Settings to manually specify a subnet (e.g., `10.0.20.0/24`) instead of relying solely on the default local network.
+- This allows scanning specific VLANs or multiple subnets available on the same physical interface.
+- **Security:** Strict IPv4 validation prevents option injection (e.g., `--file=/etc/passwd`) and size limits (max `/20`) prevent endless sweeps.
+- The status bar now indicates when a custom range is being scanned.
 
 ## Requirements
 
