@@ -5,6 +5,7 @@ import datetime
 import ipaddress
 import json
 import time
+from html import escape
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QStandardPaths, QThread, QTime, QTimer, Qt, Signal
@@ -15,9 +16,10 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTimeEdit, QVBoxLayout, QWidget,
 )
 
-from .db import Database
+from .db import MAX_NAME_LEN, Database, format_tags, normalize_name, normalize_tags, tag_list
 from .map import NetworkMap
 from .notify import DeviceEvent, Notifier
+from .portscan import COMMON_PORTS, scan_ports
 from .scanner import ScanError, parse_cidr, scan_network
 from .settings import Settings, app_icon_path, autostart_enabled, set_autostart
 from .theme import colors, stylesheet
@@ -50,21 +52,21 @@ def is_random_mac(mac):
 
 # ---- pure helpers: filtering and export (no Qt, so they can be tested without a display) ----
 DAY_SECONDS = 24 * 3600
-DEVICE_FIELDS = ("status", "ip", "hostname", "mac", "vendor", "first_seen", "last_seen")
-EVENT_FIELDS = ("time", "event", "ip", "hostname", "mac", "detail")
+DEVICE_FIELDS = ("status", "name", "tags", "ip", "hostname", "mac", "vendor", "first_seen", "last_seen")
+EVENT_FIELDS = ("time", "event", "name", "tags", "ip", "hostname", "mac", "detail")
 EXPORT_EVENT_LIMIT = 1_000_000  # "the whole log": db.events() only needs a limit
 
 
 def _haystack(d):
     mac = d["mac"] or ""
-    parts = (d["ip"], d["hostname"], mac, mac.replace(":", ""), d["vendor"])
+    parts = (d["name"], " ".join(tag_list(d["tags"])), d["ip"], d["hostname"], mac, mac.replace(":", ""), d["vendor"])
     return " ".join(p for p in parts if p).lower()
 
 
 def filter_devices(devices, query="", status=None, new_only=False, now=None):
     """Device rows that pass the search box and the filter buttons.
 
-    query:    words separated by spaces; every word must appear in ip / hostname / mac / vendor
+    query:    words separated by spaces; every word must appear in name / tags / ip / hostname / mac / vendor
     status:   None, "online" or "offline"
     new_only: only devices first seen within the last 24 hours
     """
@@ -105,6 +107,7 @@ def device_records(devices):
     return [
         {
             "status": "online" if d["online"] else "offline",
+            "name": d["name"], "tags": tag_list(d["tags"]),
             "ip": d["ip"], "hostname": d["hostname"], "mac": d["mac"], "vendor": d["vendor"],
             "first_seen": iso_time(d["first_seen"]), "last_seen": iso_time(d["last_seen"]),
         }
@@ -115,7 +118,8 @@ def device_records(devices):
 def event_records(events):
     return [
         {
-            "time": iso_time(e["ts"]), "event": e["kind"], "ip": e["ip"],
+            "time": iso_time(e["ts"]), "event": e["kind"],
+            "name": e["name"], "tags": tag_list(e["tags"]), "ip": e["ip"],
             "hostname": e["hostname"], "mac": e["mac"], "detail": e["detail"],
         }
         for e in events
@@ -129,12 +133,18 @@ def csv_safe(value):
     return value
 
 
+def _csv_cell(value):
+    if isinstance(value, list):  # tags: one cell, "a; b"
+        value = "; ".join(value)
+    return csv_safe(value)
+
+
 def write_csv(path, fields, records):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in records:
-            w.writerow({k: csv_safe(v) for k, v in r.items()})
+            w.writerow({k: _csv_cell(v) for k, v in r.items()})
 
 
 def write_json(path, records):
@@ -220,6 +230,27 @@ class ScanThread(QThread):
             self.failed.emit(str(e))
         except Exception as e:  # keep the GUI alive no matter what
             self.failed.emit(f"Unexpected scan error: {e}")
+
+
+class PortScanThread(QThread):
+    """Checks the common TCP ports of one device off the GUI thread. Never touches the database."""
+
+    done = Signal(int, str, object, int)  # device id, ip, open ports, number of ports checked
+    failed = Signal(int, str, str)        # device id, ip, message
+
+    def __init__(self, dev_id, ip):
+        super().__init__()
+        self.dev_id = dev_id
+        self.ip = ip
+
+    def run(self):
+        try:
+            open_ports = scan_ports(self.ip)
+            self.done.emit(self.dev_id, self.ip, open_ports, len(COMMON_PORTS))
+        except ValueError as e:  # invalid / non-local address
+            self.failed.emit(self.dev_id, self.ip, str(e))
+        except Exception as e:  # keep the GUI alive no matter what
+            self.failed.emit(self.dev_id, self.ip, f"Unexpected error: {e}")
 
 
 class SettingsDialog(QDialog):
@@ -406,6 +437,10 @@ class MainWindow(QMainWindow):
         self.scan_info = ""
         self.last_scan_ts = None
         self.export_dir = db.get_meta("export_dir")
+        self._edit_dev_id = None   # device the name/tags fields currently belong to
+        self.port_results = {}     # device id -> last port scan result (this session)
+        self.port_threads = {}     # device id -> PortScanThread (kept alive while it runs)
+        self.port_scanning = set() # device ids with a scan in progress
         self.tray = None
         self.has_tray = False
         self._quitting = False
@@ -488,7 +523,7 @@ class MainWindow(QMainWindow):
         fv.setContentsMargins(0, 0, 0, 0)
         fv.setSpacing(4)
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search IP, name, MAC, vendor...   (Ctrl+F)")
+        self.search_edit.setPlaceholderText("Search name, tags, IP, MAC, vendor...   (Ctrl+F)")
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self.on_filter_changed)
         fv.addWidget(self.search_edit)
@@ -515,11 +550,13 @@ class MainWindow(QMainWindow):
         esc.setContext(Qt.WidgetShortcut)
         esc.activated.connect(self.search_edit.clear)
 
-        self.dev_table = make_table(["STATUS", "IP", "HOSTNAME", "MAC"])
+        self.dev_table = make_table(["STATUS", "IP", "NAME", "TAGS", "MAC"])
         self.dev_table.itemSelectionChanged.connect(self.on_select)
         hh = self.dev_table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         lb.addWidget(self.dev_table)
         sc = QShortcut(QKeySequence.Delete, self.dev_table)
         sc.setContext(Qt.WidgetShortcut)
@@ -540,7 +577,32 @@ class MainWindow(QMainWindow):
         self.detail_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.detail_label.setStyleSheet("background: transparent;")
         fl.addWidget(self.detail_label)
+
+        self.edit_box = QWidget()  # custom name and tags
+        self.edit_box.setObjectName("editBox")
+        ev = QVBoxLayout(self.edit_box)
+        ev.setContentsMargins(0, 0, 0, 0)
+        ev.setSpacing(2)
+        ev.addWidget(section("NAME"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setMaxLength(MAX_NAME_LEN)
+        self.name_edit.setPlaceholderText("Custom name (shown instead of the hostname)")
+        self.name_edit.editingFinished.connect(self._on_edit_finished)
+        ev.addWidget(self.name_edit)
+        ev.addWidget(section("TAGS"))
+        self.tags_edit = QLineEdit()
+        self.tags_edit.setPlaceholderText("Tags, comma separated (e.g. tv, living room)")
+        self.tags_edit.editingFinished.connect(self._on_edit_finished)
+        ev.addWidget(self.tags_edit)
+        self.edit_box.setEnabled(False)
+        fl.addWidget(self.edit_box)
+        self._style_edit_box()
+
         fl.addStretch()
+        self.ports_btn = QPushButton("SCAN PORTS")
+        self.ports_btn.setEnabled(False)
+        self.ports_btn.clicked.connect(self.scan_ports_selected)
+        fl.addWidget(self.ports_btn)
         self.forget_btn = QPushButton("FORGET DEVICE")
         self.forget_btn.setEnabled(False)
         self.forget_btn.clicked.connect(self.forget_selected)
@@ -563,7 +625,7 @@ class MainWindow(QMainWindow):
             "Save the whole event history (not just the rows shown here) as CSV or JSON",
             self.export_events))
         ll.addLayout(ehead)
-        self.event_table = make_table(["TIME", "EVENT", "IP", "HOSTNAME", "DETAIL"])
+        self.event_table = make_table(["TIME", "EVENT", "IP", "NAME", "DETAIL"])
         eh = self.event_table.horizontalHeader()
         eh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         eh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -647,6 +709,9 @@ class MainWindow(QMainWindow):
         self.poll_timer.stop()
         if self.scan_thread is not None and self.scan_thread.isRunning():
             self.scan_thread.wait(5000)
+        for t in self.port_threads.values():
+            if t.isRunning():
+                t.wait(3000)
         if self.tray is not None:
             self.tray.hide()
 
@@ -679,6 +744,7 @@ class MainWindow(QMainWindow):
         QApplication.instance().setStyleSheet(stylesheet(name))
         self.map.set_theme(name)
         self._style_filter_bar()
+        self._style_edit_box()
         self.status.setStyleSheet("")
         self.refresh()
 
@@ -704,7 +770,7 @@ class MainWindow(QMainWindow):
             self.event_table.setItem(r, 0, QTableWidgetItem(fmt_time(e["ts"])))
             self.event_table.setItem(r, 1, kind)
             self.event_table.setItem(r, 2, QTableWidgetItem(e["ip"] or "-"))
-            self.event_table.setItem(r, 3, QTableWidgetItem(e["hostname"] or "-"))
+            self.event_table.setItem(r, 3, QTableWidgetItem(e["name"] or e["hostname"] or "-"))
             self.event_table.setItem(r, 4, QTableWidgetItem(e["detail"] or ""))
 
         self.map.set_data(devices, self.gateway_ip, self.self_mac, self.db.positions(), self.selected_id)
@@ -759,8 +825,12 @@ class MainWindow(QMainWindow):
             st.setData(Qt.UserRole, d["id"])
             self.dev_table.setItem(r, 0, st)
             self.dev_table.setItem(r, 1, QTableWidgetItem(d["ip"] or "-"))
-            self.dev_table.setItem(r, 2, QTableWidgetItem(d["hostname"] or "-"))
-            self.dev_table.setItem(r, 3, QTableWidgetItem(d["mac"] or "-"))
+            name_item = QTableWidgetItem(d["name"] or d["hostname"] or "-")
+            if d["name"] and d["hostname"]:
+                name_item.setToolTip(f"Hostname: {d['hostname']}")
+            self.dev_table.setItem(r, 2, name_item)
+            self.dev_table.setItem(r, 3, QTableWidgetItem(format_tags(d["tags"])))
+            self.dev_table.setItem(r, 4, QTableWidgetItem(d["mac"] or "-"))
             if d["id"] == self.selected_id:
                 select_row = r
         if select_row is not None:
@@ -853,20 +923,36 @@ class MainWindow(QMainWindow):
 
     def show_details(self):
         d = self.db.device(self.selected_id) if self.selected_id else None
+        new_id = d["id"] if d else None
+        if self._edit_dev_id is not None and new_id != self._edit_dev_id:
+            self._store_edits(self._edit_dev_id)  # unsaved typing goes to the device it was typed for
         if not d:
+            self._edit_dev_id = None
             self.detail_label.setText("Select a device.")
+            self.name_edit.clear()
+            self.tags_edit.clear()
+            self.edit_box.setEnabled(False)
             self.forget_btn.setEnabled(False)
+            self._update_ports_button(None)
             return
+        # Refreshes (every scan) must not overwrite what the user is typing right now.
+        if new_id != self._edit_dev_id or not self.name_edit.hasFocus():
+            self.name_edit.setText(d["name"] or "")
+        if new_id != self._edit_dev_id or not self.tags_edit.hasFocus():
+            self.tags_edit.setText(format_tags(d["tags"]))
+        self._edit_dev_id = new_id
+        self.edit_box.setEnabled(True)
         self.forget_btn.setEnabled(True)
+        self._update_ports_button(d)
         online = bool(d["online"])
         color = self.c["online"] if online else self.c["offline"]
         dim = self.c["text_dim"]
-        rows = [
+        rows = [  # values that come from the network are escaped: a rogue device must not inject markup
             ("STATUS", f"<span style='color:{color}'>{'ONLINE' if online else 'OFFLINE'}</span>"),
-            ("IP", d["ip"] or "-"),
-            ("HOSTNAME", d["hostname"] or "-"),
-            ("MAC", d["mac"] or "-"),
-            ("VENDOR", d["vendor"] or "-"),
+            ("IP", escape(d["ip"] or "-")),
+            ("HOSTNAME", escape(d["hostname"] or "-")),
+            ("MAC", escape(d["mac"] or "-")),
+            ("VENDOR", escape(d["vendor"] or "-")),
             ("FIRST SEEN", fmt_datetime(d["first_seen"])),
             ("LAST SEEN", fmt_datetime(d["last_seen"])),
         ]
@@ -876,10 +962,97 @@ class MainWindow(QMainWindow):
             rows.insert(1, ("ROLE", "THIS PC"))
         if is_random_mac(d["mac"]):
             rows.append(("NOTE", "randomized MAC (private Wi-Fi address)"))
+        rows.append(("PORTS", self._ports_html(d)))
         html = "<table cellspacing='6'>" + "".join(
             f"<tr><td style='color:{dim}'>{k}</td><td>{v}</td></tr>" for k, v in rows
         ) + "</table>"
         self.detail_label.setText(html)
+
+    # ---- name / tags editing ----
+    def _style_edit_box(self):
+        self.edit_box.setStyleSheet(
+            "QWidget#editBox, QWidget#editBox QLabel { background: transparent; }" + line_edit_qss(self.c)
+        )
+
+    def _store_edits(self, dev_id):
+        """Save the name/tags fields for `dev_id` if they differ from the database. True if something changed."""
+        d = self.db.device(dev_id)
+        if d is None:
+            return False
+        changed = False
+        name = normalize_name(self.name_edit.text())
+        if name != (d["name"] or ""):
+            self.db.set_name(dev_id, name)
+            changed = True
+        tags = normalize_tags(self.tags_edit.text())
+        if tags != (d["tags"] or ""):
+            self.db.set_tags(dev_id, tags)
+            changed = True
+        if changed:
+            QTimer.singleShot(0, self.refresh)  # list, map and log show the new name once this event is handled
+        return changed
+
+    def _on_edit_finished(self):
+        """Enter pressed or focus left a field: save, and show the cleaned-up text."""
+        if self._edit_dev_id is None:
+            return
+        self._store_edits(self._edit_dev_id)
+        self.name_edit.setText(normalize_name(self.name_edit.text()))
+        self.tags_edit.setText(format_tags(normalize_tags(self.tags_edit.text())))
+
+    # ---- port scan ----
+    def _update_ports_button(self, d):
+        scanning = d is not None and d["id"] in self.port_scanning
+        self.ports_btn.setEnabled(d is not None and bool(d["online"]) and bool(d["ip"]) and not scanning)
+        self.ports_btn.setText("SCANNING PORTS..." if scanning else "SCAN PORTS")
+        if d is not None and not d["online"]:
+            self.ports_btn.setToolTip("The device is offline")
+        else:
+            self.ports_btn.setToolTip("Check a few common TCP ports (22, 80, 443, 445, 3389, ...) on this device")
+
+    def _ports_html(self, d):
+        c = self.c
+        dim = f"<span style='color:{c['text_dim']}'>"
+        if d["id"] in self.port_scanning:
+            return f"{dim}scanning...</span>"
+        res = self.port_results.get(d["id"])
+        if res is None or res["ip"] != d["ip"]:  # never scanned, or scanned under an older IP
+            return f"{dim}not scanned</span>"
+        if res["error"]:
+            return f"<span style='color:{c['accent_bright']}'>{escape(res['error'])}</span>"
+        stamp = f"{dim}{res['checked']} ports checked at {fmt_time(res['ts'])}</span>"
+        if not res["open"]:
+            return f"none open<br>{stamp}"
+        lines = "<br>".join(
+            f"<span style='color:{c['accent_bright']}'>{p}</span> {escape(COMMON_PORTS.get(p, ''))}"
+            for p in res["open"]
+        )
+        return f"{lines}<br>{stamp}"
+
+    def scan_ports_selected(self):
+        d = self.db.device(self.selected_id) if self.selected_id else None
+        if not d or not d["ip"] or not d["online"] or d["id"] in self.port_scanning:
+            return
+        thread = PortScanThread(d["id"], d["ip"])
+        thread.done.connect(self.on_ports_done)
+        thread.failed.connect(self.on_ports_failed)
+        self.port_threads[d["id"]] = thread  # keep a reference while it runs
+        self.port_scanning.add(d["id"])
+        thread.start()
+        self.show_details()
+
+    def on_ports_done(self, dev_id, ip, open_ports, checked):
+        self.port_scanning.discard(dev_id)
+        self.port_results[dev_id] = {"ip": ip, "open": list(open_ports), "checked": checked,
+                                     "ts": time.time(), "error": None}
+        if dev_id == self.selected_id:
+            self.show_details()
+
+    def on_ports_failed(self, dev_id, ip, message):
+        self.port_scanning.discard(dev_id)
+        self.port_results[dev_id] = {"ip": ip, "open": [], "checked": 0, "ts": time.time(), "error": message}
+        if dev_id == self.selected_id:
+            self.show_details()
 
     # ---- scanning ----
     def start_scan(self):
@@ -907,7 +1080,7 @@ class MainWindow(QMainWindow):
             seen.add(h.mac)
             prev = previous.get(h.mac)
             old_ip = prev["ip"] if prev else ""
-            name = h.hostname or (prev["hostname"] if prev else "") or ""
+            name = (prev["name"] if prev else "") or h.hostname or (prev["hostname"] if prev else "") or ""
             for kind in self.db.observe(h.ip, h.mac, h.hostname, online=True, vendor=h.vendor):
                 events.append(DeviceEvent(kind, h.ip, name, old_ip if kind == "ip_changed" else "", h.vendor or ""))
 
@@ -939,7 +1112,7 @@ class MainWindow(QMainWindow):
                         self.db.record_miss(d["id"], threshold=1)
                         continue
                     for kind in self.db.record_miss(d["id"], **kwargs):
-                        events.append(DeviceEvent(kind, d["ip"] or "", d["hostname"] or ""))
+                        events.append(DeviceEvent(kind, d["ip"] or "", d["name"] or d["hostname"] or ""))
 
         self.last_scan_ts = time.time()
         self.refresh()
@@ -971,7 +1144,7 @@ class MainWindow(QMainWindow):
         d = self.db.device(self.selected_id) if self.selected_id else None
         if not d:
             return
-        label = d["hostname"] or d["ip"] or d["mac"]
+        label = d["name"] or d["hostname"] or d["ip"] or d["mac"]
         answer = QMessageBox.question(
             self, "Forget device",
             f"Forget {label} and its event history?\n(If it is still on the network it will reappear on the next scan.)",
@@ -979,6 +1152,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
         self.db.forget_device(d["id"])
+        self.port_results.pop(d["id"], None)
         self.selected_id = None
         self.refresh()
 

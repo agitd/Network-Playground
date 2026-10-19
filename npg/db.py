@@ -14,6 +14,42 @@ DB_PATH = DB_DIR / "netplay.db"
 
 MISS_THRESHOLD = 2  # consecutive missed scans before a device is marked offline
 
+MAX_NAME_LEN = 64
+MAX_TAG_LEN = 32
+MAX_TAGS = 20
+
+
+def normalize_name(text):
+    """Trim, squeeze whitespace and control characters, cap the length. '' means 'no custom name'."""
+    if not text:
+        return ""
+    printable = "".join(ch if ch.isprintable() else " " for ch in str(text))
+    return " ".join(printable.split())[:MAX_NAME_LEN].strip()
+
+
+def tag_list(stored):
+    """Stored tags ('tv,living room') -> ['tv', 'living room']."""
+    return [t for t in (stored or "").split(",") if t]
+
+
+def format_tags(stored):
+    """Stored tags -> the form shown to people: 'tv, living room'."""
+    return ", ".join(tag_list(stored))
+
+
+def normalize_tags(text):
+    """'tv, Living  Room,,TV' -> 'tv,Living Room': comma-separated, trimmed, de-duplicated ignoring case."""
+    seen, out = set(), []
+    for raw in str(text or "").split(","):
+        tag = normalize_name(raw)[:MAX_TAG_LEN].strip()
+        if tag and tag.casefold() not in seen:
+            seen.add(tag.casefold())
+            out.append(tag)
+        if len(out) >= MAX_TAGS:
+            break
+    return ",".join(out)
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -22,6 +58,8 @@ CREATE TABLE IF NOT EXISTS devices (
     ip         TEXT,
     hostname   TEXT,
     vendor     TEXT,
+    name       TEXT,                    -- custom name chosen by the user
+    tags       TEXT,                    -- custom tags, comma-separated
     online     INTEGER NOT NULL DEFAULT 0,
     misses     INTEGER NOT NULL DEFAULT 0,  -- consecutive missed scans
     first_seen REAL NOT NULL,
@@ -51,12 +89,16 @@ class Database:
         self.conn = sqlite3.connect(str(path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
-        # Migration for databases created by stage 1/2 (no `misses` column).
+        # Migrations for databases created by older versions (missing columns are added in place).
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(devices)")}
         if "misses" not in cols:
             self.conn.execute("ALTER TABLE devices ADD COLUMN misses INTEGER NOT NULL DEFAULT 0")
         if "vendor" not in cols:
             self.conn.execute("ALTER TABLE devices ADD COLUMN vendor TEXT")
+        if "name" not in cols:
+            self.conn.execute("ALTER TABLE devices ADD COLUMN name TEXT")
+        if "tags" not in cols:
+            self.conn.execute("ALTER TABLE devices ADD COLUMN tags TEXT")
         self.conn.commit()
 
     # ---- writes -----------------------------------------------------------
@@ -141,6 +183,20 @@ class Database:
             self.forget_device(i)
         return len(ids)
 
+    def set_name(self, device_id, name):
+        """Store a custom name ('' clears it). Scans never touch it. Returns the cleaned-up value stored."""
+        name = normalize_name(name)
+        self.conn.execute("UPDATE devices SET name=? WHERE id=?", (name or None, device_id))
+        self.conn.commit()
+        return name
+
+    def set_tags(self, device_id, tags):
+        """Store custom tags from comma-separated text ('' clears them). Returns the cleaned-up value stored."""
+        tags = normalize_tags(tags)
+        self.conn.execute("UPDATE devices SET tags=? WHERE id=?", (tags or None, device_id))
+        self.conn.commit()
+        return tags
+
     # ---- small key/value store (gateway ip, own MAC, map positions) ----
     def get_meta(self, key):
         r = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -176,7 +232,7 @@ class Database:
 
     def events(self, limit=200, device_id=None):
         sql = (
-            "SELECT e.*, d.ip AS ip, d.hostname AS hostname, d.mac AS mac "
+            "SELECT e.*, d.ip AS ip, d.hostname AS hostname, d.mac AS mac, d.name AS name, d.tags AS tags "
             "FROM events e JOIN devices d ON d.id = e.device_id "
         )
         args = []

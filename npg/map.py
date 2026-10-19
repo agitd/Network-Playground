@@ -126,7 +126,7 @@ class NetworkMap(QGraphicsView):
         if is_hub:
             lines.append("GATEWAY")
         lines.append(d["ip"] or "?")
-        host = d["hostname"]
+        host = d["name"] or d["hostname"]  # a custom name wins over the network hostname
         if host:
             lines.append(host if len(host) <= 22 else host[:21] + "…")
         if is_self:
