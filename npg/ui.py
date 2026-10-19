@@ -2,6 +2,7 @@
 
 import csv
 import datetime
+import ipaddress
 import json
 import time
 from pathlib import Path
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (
 from .db import Database
 from .map import NetworkMap
 from .notify import DeviceEvent, Notifier
-from .scanner import ScanError, scan_network
+from .scanner import ScanError, parse_cidr, scan_network
 from .settings import Settings, app_icon_path, autostart_enabled, set_autostart
 from .theme import colors, stylesheet
 
@@ -83,6 +84,14 @@ def filter_devices(devices, query="", status=None, new_only=False, now=None):
                 continue
         out.append(d)
     return out
+
+
+def ip_in_network(ip, network):
+    """True if `ip` lies inside the CIDR string `network`; False for anything unparsable."""
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(network, strict=False)
+    except (ValueError, TypeError):
+        return False
 
 
 def iso_time(ts):
@@ -159,6 +168,17 @@ def section(text):
     return lbl
 
 
+def line_edit_qss(c):
+    """Themed look for QLineEdit."""
+    return f"""
+        QLineEdit {{
+            background-color: {c['panel']}; border: 1px solid {c['border']}; padding: 4px 8px;
+            selection-background-color: {c['accent']}; selection-color: #ffffff;
+        }}
+        QLineEdit:focus {{ border-color: {c['accent']}; }}
+    """
+
+
 def make_app_icon():
     """Window / tray icon, painted in code (same design as the installed SVG)."""
     pm = QPixmap(128, 128)
@@ -188,13 +208,14 @@ class ScanThread(QThread):
     scanned = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, known):
+    def __init__(self, known, cidr=""):
         super().__init__()
         self.known = known  # [(ip, mac)] read on the GUI thread; the worker never touches the DB
+        self.cidr = cidr    # custom range from Settings; "" = scan the local network
 
     def run(self):
         try:
-            self.scanned.emit(scan_network(self.known))
+            self.scanned.emit(scan_network(self.known, self.cidr))
         except ScanError as e:
             self.failed.emit(str(e))
         except Exception as e:  # keep the GUI alive no matter what
@@ -212,7 +233,27 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings")
         self.setModal(True)
         self.setMinimumWidth(420)
+        self.theme_name = settings.theme
+        self._cidr_state = ("", False)  # (status text, is_error)
         lay = QVBoxLayout(self)
+
+        # ---- scan target ----
+        lay.addWidget(section("SCAN TARGET"))
+        self.cidr_edit = QLineEdit(settings.get("custom_cidr"))
+        self.cidr_edit.setPlaceholderText("Custom range, e.g. 10.0.20.0/24   (empty = local network)")
+        self.cidr_edit.setClearButtonEnabled(True)
+        self.cidr_edit.editingFinished.connect(self._save_cidr)
+        lay.addWidget(self.cidr_edit)
+        self.cidr_status = QLabel()
+        self.cidr_status.setWordWrap(True)
+        lay.addWidget(self.cidr_status)
+        note = QLabel("ARP does not cross routers: this PC must be on that VLAN's network segment "
+                      "(for example through a trunk or a VLAN interface) to see its devices.")
+        note.setObjectName("statusBar")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        self._set_cidr_status(self._scan_target_text(settings.get("custom_cidr")))
+        self._style_inputs()
 
         # ---- notifications ----
         lay.addWidget(section("NOTIFICATIONS"))
@@ -223,6 +264,7 @@ class SettingsDialog(QDialog):
             lay.addWidget(cb)
         row = QHBoxLayout()
         test_btn = QPushButton("SEND TEST NOTIFICATION")
+        test_btn.setAutoDefault(False)
         test_btn.clicked.connect(self.notifier.send_test)
         row.addWidget(test_btn)
         row.addStretch()
@@ -252,7 +294,7 @@ class SettingsDialog(QDialog):
         for name, text in (("dark", "Dark"), ("light", "Light")):
             rb = QRadioButton(text)
             rb.setChecked(settings.theme == name)
-            rb.toggled.connect(lambda on, n=name: self.apply_theme(n) if on else None)
+            rb.toggled.connect(lambda on, n=name: self._pick_theme(n) if on else None)
             row.addWidget(rb)
         row.addStretch()
         lay.addLayout(row)
@@ -275,9 +317,56 @@ class SettingsDialog(QDialog):
         row = QHBoxLayout()
         row.addStretch()
         close_btn = QPushButton("CLOSE")
+        close_btn.setAutoDefault(False)
         close_btn.clicked.connect(self.accept)
         row.addWidget(close_btn)
         lay.addLayout(row)
+
+    # ---- scan target ----
+    @staticmethod
+    def _scan_target_text(value):
+        return f"Scanning {value} instead of the local network." if value else "Scanning your local network."
+
+    def _set_cidr_status(self, text, error=False):
+        self._cidr_state = (text, error)
+        self._apply_cidr_status()
+
+    def _apply_cidr_status(self):
+        text, error = self._cidr_state
+        self.cidr_status.setText(text)
+        self.cidr_status.setStyleSheet(f"color: {colors(self.theme_name)['accent_bright']};" if error else "")
+
+    def _style_inputs(self):
+        self.cidr_edit.setStyleSheet(line_edit_qss(colors(self.theme_name)))
+        self._apply_cidr_status()
+
+    def _save_cidr(self):
+        """Validate and store the custom range. Returns False (and saves nothing) if it is invalid."""
+        try:
+            value = parse_cidr(self.cidr_edit.text())
+        except ValueError as e:
+            current = self.settings.get("custom_cidr") or "the local network"
+            self._set_cidr_status(f"Not saved: {e} Still scanning {current}.", error=True)
+            return False
+        self.settings.set("custom_cidr", value)
+        self.cidr_edit.setText(value)  # normalized, e.g. 10.0.20.7/24 -> 10.0.20.0/24
+        self._set_cidr_status(self._scan_target_text(value))
+        return True
+
+    def accept(self):
+        if self._save_cidr():  # an invalid range keeps the dialog open so the error stays visible
+            super().accept()
+        else:
+            self.cidr_edit.setFocus()
+
+    def reject(self):
+        self._save_cidr()  # Esc / window close: keep a valid pending edit, drop an invalid one
+        super().reject()
+
+    def _pick_theme(self, name):
+        self.theme_name = name
+        self.apply_theme(name)
+        self._style_inputs()
 
     def _time_edit(self, t, key):
         edit = QTimeEdit(QTime(t.hour, t.minute))
@@ -577,7 +666,10 @@ class MainWindow(QMainWindow):
 
     # ---- settings / theme ----
     def open_settings(self):
+        before = self.settings.get("custom_cidr")
         SettingsDialog(self, self.settings, self.notifier, self.apply_theme, self.has_tray).exec()
+        if self.settings.get("custom_cidr") != before:
+            self.start_scan()  # pick up the new target now instead of in up to 30 s
 
     def apply_theme(self, name):
         """Live theme switch: new stylesheet, new map palette, repaint everything."""
@@ -634,12 +726,7 @@ class MainWindow(QMainWindow):
     # ---- search / filters ----
     def _style_filter_bar(self):
         c = self.c
-        self.filter_bar.setStyleSheet(f"""
-            QLineEdit {{
-                background-color: {c['panel']}; border: 1px solid {c['border']}; padding: 4px 8px;
-                selection-background-color: {c['accent']}; selection-color: #ffffff;
-            }}
-            QLineEdit:focus {{ border-color: {c['accent']}; }}
+        self.filter_bar.setStyleSheet(line_edit_qss(c) + f"""
             QPushButton:checked {{
                 background-color: {c['accent']}; color: #ffffff; border-color: {c['accent_bright']};
             }}
@@ -803,7 +890,7 @@ class MainWindow(QMainWindow):
         self.status.setStyleSheet("")
         self.status.setText("Scanning network...")
         known = [(d["ip"], d["mac"]) for d in self.db.devices() if d["ip"] and d["mac"]]
-        self.scan_thread = ScanThread(known)
+        self.scan_thread = ScanThread(known, self.settings.get("custom_cidr"))
         self.scan_thread.scanned.connect(self.on_scanned)
         self.scan_thread.failed.connect(self.on_scan_failed)
         self.scan_thread.finished.connect(self.on_scan_finished)
@@ -833,7 +920,8 @@ class MainWindow(QMainWindow):
         if result.gateway_ip:
             self.gateway_ip = result.gateway_ip
             self.db.set_meta("gateway_ip", result.gateway_ip)
-        self.scan_info = f"{result.network or '?'} via {result.interface or '?'}"
+        self.scan_info = f"{result.network or '?'} via {result.interface or '?'}" \
+            + (" (custom range)" if result.custom else "")
 
         if hosts:
             # Known-online devices that were not seen count as a miss; after MISS_THRESHOLD
@@ -842,8 +930,14 @@ class MainWindow(QMainWindow):
             # silently, because that scan sends no notifications.
             # (An empty result is treated as a failed scan, not "everyone left".)
             kwargs = {"threshold": 1} if first_scan else {}
+            scope = result.network if result.custom else None
             for d in self.db.devices():
                 if d["online"] and (d["mac"] or d["key"]) not in seen:
+                    if scope is not None and not ip_in_network(d["ip"], scope):
+                        # Outside the custom range, so this scan never looked for it: mark it
+                        # offline quietly instead of alerting about every device of the other network.
+                        self.db.record_miss(d["id"], threshold=1)
+                        continue
                     for kind in self.db.record_miss(d["id"], **kwargs):
                         events.append(DeviceEvent(kind, d["ip"] or "", d["hostname"] or ""))
 

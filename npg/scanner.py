@@ -45,7 +45,8 @@ class ScanResult:
     self_host: Optional[Host] = None  # this computer (arp-scan never lists itself)
     gateway_ip: Optional[str] = None
     interface: Optional[str] = None
-    network: Optional[str] = None     # e.g. "192.168.0.0/24"
+    network: Optional[str] = None     # the range that was scanned, e.g. "192.168.0.0/24"
+    custom: bool = False              # True when a custom range replaced the local network
 
 
 # ---- local network info ------------------------------------------------------
@@ -105,11 +106,49 @@ def _parse(stdout):
     return hosts
 
 
-def arp_scan(exe, iface):
-    """Broadcast sweep of the whole local subnet."""
-    cmd = [exe, "--localnet", "--plain", "--ignoredups", "--retry=3", "--timeout=400"]
+MIN_CIDR_PREFIX = 20  # 4096 addresses; bigger sweeps are too slow for a monitor that rescans every 30 s
+
+
+def parse_cidr(text):
+    """Validate a user-entered IPv4 range.
+
+    Returns the normalized 'a.b.c.d/n' string, or '' when `text` is empty (= use the local network).
+    Raises ValueError with a message that can be shown to the user. The result is handed to
+    arp-scan as a command-line argument, so anything that is not a plain IPv4 network is rejected.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        net = ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        raise ValueError(f"'{text}' is not a valid IPv4 range. Use CIDR notation, e.g. 10.0.20.0/24.") from None
+    if net.version != 4:
+        raise ValueError("Only IPv4 ranges are supported (arp-scan is IPv4 only).")
+    if net.prefixlen < MIN_CIDR_PREFIX:
+        raise ValueError(f"{net} is too large; the biggest range allowed is /{MIN_CIDR_PREFIX} (4096 addresses).")
+    return str(net)
+
+
+def _scan_cmd(exe, iface, target=None):
+    """arp-scan command line.
+
+    No target: sweep the interface's own subnet (--localnet).
+    With a target (a validated CIDR): scan exactly that range, given as the positional argument.
+    """
+    cmd = [exe, "--plain", "--ignoredups", "--retry=3", "--timeout=400"]
+    if not target:
+        cmd.append("--localnet")
     if iface:
         cmd += ["--interface", iface]
+    if target:
+        cmd.append(target)
+    return cmd
+
+
+def arp_scan(exe, iface, target=None):
+    """Broadcast sweep of `target` (a validated CIDR) or, by default, the whole local subnet."""
+    cmd = _scan_cmd(exe, iface, target)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
     except subprocess.TimeoutExpired:
@@ -174,24 +213,32 @@ def resolve_hostnames(hosts, timeout=3.0):
 
 
 # ---- entry point -----------------------------------------------------------------
-def scan_network(known=None) -> ScanResult:
-    """known: [(ip, mac), ...] devices already in the database (used for unicast re-checks)."""
+def scan_network(known=None, cidr=None) -> ScanResult:
+    """known: [(ip, mac), ...] devices already in the database (used for unicast re-checks).
+    cidr:  optional custom range (e.g. a VLAN) to scan instead of the interface's own subnet.
+    """
+    try:
+        target = parse_cidr(cidr)
+    except ValueError as e:
+        raise ScanError(f"Custom scan range: {e}")
+
     exe = _find_arp_scan()
     iface, gateway = default_route()
-    self_ip, network = interface_addr(iface) if iface else (None, None)
+    self_ip, iface_net = interface_addr(iface) if iface else (None, None)
     self_mac = interface_mac(iface) if iface else None
+    scan_net = ipaddress.ip_network(target) if target else iface_net
 
-    hosts = [h for h in arp_scan(exe, iface) if h.ip != self_ip]
+    hosts = [h for h in arp_scan(exe, iface, target or None) if h.ip != self_ip]
     found = {h.mac for h in hosts}
 
     candidates = []
     for ip, mac in known or []:
         if not mac or mac in found or mac == self_mac:
             continue
-        if network is not None:
+        if scan_net is not None:
             try:
-                if ipaddress.ip_address(ip) not in network:
-                    continue  # stale entry from another network
+                if ipaddress.ip_address(ip) not in scan_net:
+                    continue  # not part of what is being scanned
             except ValueError:
                 continue
         candidates.append((ip, mac))
@@ -208,5 +255,6 @@ def scan_network(known=None) -> ScanResult:
         self_host=self_host,
         gateway_ip=gateway,
         interface=iface,
-        network=str(network) if network else None,
+        network=str(scan_net) if scan_net else None,
+        custom=bool(target),
     )

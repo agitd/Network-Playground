@@ -1,7 +1,10 @@
 """Logic tests that need no display or Qt:   python3 tests/test_logic.py"""
 
+import ast
+import contextlib
 import csv
 import datetime as dt
+import ipaddress
 import json
 import os
 import re
@@ -12,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from npg import scanner as sc  # noqa: E402
 from npg import theme  # noqa: E402
 from npg.db import Database  # noqa: E402
 from npg.notify import DeviceEvent, Notifier, in_quiet_hours  # noqa: E402
@@ -367,7 +371,7 @@ def load_ui_helpers():
     """ui.py needs Qt to import, so run just its Qt-free helper block."""
     src = (Path(__file__).resolve().parent.parent / "npg" / "ui.py").read_text()
     a, b = src.index("# ---- pure helpers"), src.index("# ---- end pure helpers ----")
-    ns = {"time": time, "datetime": dt, "csv": csv, "json": json}
+    ns = {"time": time, "datetime": dt, "csv": csv, "json": json, "ipaddress": ipaddress}
     exec(src[a:b], ns)
     return ns
 
@@ -531,6 +535,165 @@ def helper_block_has_no_qt():
     src = (Path(__file__).resolve().parent.parent / "npg" / "ui.py").read_text()
     block = src[src.index("# ---- pure helpers"):src.index("# ---- end pure helpers ----")]
     assert not re.findall(r"\bQ[A-Z]\w+", block) and "PySide" not in block
+
+
+
+# ======================= stage 7: custom CIDR scan target =======================
+@contextlib.contextmanager
+def patched(module, **attrs):
+    saved = {k: getattr(module, k) for k in attrs}
+    for k, v in attrs.items():
+        setattr(module, k, v)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            setattr(module, k, v)
+
+
+@test
+def parse_cidr_accepts_and_normalises():
+    p = sc.parse_cidr
+    assert [p(x) for x in ("", None, "   ")] == ["", "", ""]                      # empty = local network
+    assert p("10.0.20.0/24") == "10.0.20.0/24" and p("  10.0.20.0/24 \n") == "10.0.20.0/24"
+    assert p("10.0.20.7/24") == "10.0.20.0/24"                                    # host bits are cleared
+    assert p("10.0.20.0/255.255.255.0") == "10.0.20.0/24"                         # netmask form
+    assert p("10.0.20.5") == "10.0.20.5/32" and p("10.0.16.0/20") == "10.0.16.0/20"
+    assert p(p("172.16.5.9/22")) == p("172.16.5.9/22")                            # idempotent
+
+
+@test
+def parse_cidr_rejects_garbage_oversize_ipv6_and_option_injection():
+    bad = ["abc", "10.0.0.0/33", "300.1.1.1/24", "10.0.20.0/", "10.0.20", "10.0.0.0/19", "10.0.0.0/8", "0.0.0.0/0",
+           "::1/128", "fe80::/64",
+           "--file=/etc/passwd", "-f /etc/passwd", "-I eth0", "--localnet",
+           "10.0.20.0/24 10.0.21.0/24", "10.0.20.0/24,10.0.21.0/24", "10.0.20.0/24; rm -rf ~", "$(id)", "`id`",
+           "10.0.20.0/24\n--file=x"]
+    for text in bad:
+        try:
+            sc.parse_cidr(text)
+        except ValueError as e:
+            assert str(e), text
+        else:
+            raise AssertionError(f"accepted {text!r}")
+    for ok in ("10.0.20.0/24", "192.168.99.7/28", "10.0.20.5"):
+        assert re.fullmatch(r"\d+\.\d+\.\d+\.\d+/\d+", sc.parse_cidr(ok))   # always digits first, never an option
+
+
+@test
+def arp_scan_command_uses_positional_target_instead_of_localnet():
+    plain = sc._scan_cmd("arp-scan", "eno1")
+    assert "--localnet" in plain and plain[-2:] == ["--interface", "eno1"]
+    assert {"--plain", "--ignoredups", "--retry=3", "--timeout=400"} <= set(plain)
+    custom = sc._scan_cmd("arp-scan", "eno1", "10.0.20.0/24")
+    assert "--localnet" not in custom
+    assert custom[-3:] == ["--interface", "eno1", "10.0.20.0/24"]                 # target is the last positional argument
+    assert custom[0] == "arp-scan" and custom.count("10.0.20.0/24") == 1
+    assert sc._scan_cmd("arp-scan", None, "10.0.20.0/24")[-1] == "10.0.20.0/24"   # no interface known
+    assert "--localnet" in sc._scan_cmd("arp-scan", "eno1", "") and "--localnet" in sc._scan_cmd("arp-scan", "eno1", None)
+
+
+def scanner_env(arp_calls, verify_calls):
+    outs = {
+        ("ip", "-o", "-4", "route", "show", "default"): "default via 192.168.0.1 dev eno1 proto dhcp metric 100\n",
+        ("ip", "-o", "-4", "addr", "show", "dev", "eno1"):
+            "2: eno1    inet 192.168.0.23/24 brd 192.168.0.255 scope global dynamic eno1\n",
+    }
+
+    def fake_arp(exe, iface, target=None):
+        arp_calls.append((exe, iface, target))
+        if target:
+            return [sc.Host("10.0.20.1", "aa:00:00:00:20:01"), sc.Host("192.168.0.23", "aa:00:00:00:00:99")]
+        return [sc.Host("192.168.0.1", "c0:b3:c8:a3:8f:e4")]
+
+    def fake_verify(exe, iface, ip, mac):
+        verify_calls.append((ip, mac))
+        return None
+
+    return dict(_run=lambda cmd, timeout=5: outs.get(tuple(cmd), ""), _find_arp_scan=lambda: "arp-scan",
+                interface_mac=lambda i: "aa:00:00:00:00:99", resolve_hostnames=lambda h, timeout=3.0: None,
+                arp_scan=fake_arp, _verify_one=fake_verify)
+
+
+KNOWN = [("192.168.0.50", "aa:00:00:00:00:50"),   # on the local LAN, silent
+         ("10.0.20.9", "aa:00:00:00:20:09"),      # inside the custom range, silent
+         ("10.0.20.1", "aa:00:00:00:20:01")]      # inside the custom range, answers the sweep
+
+
+@test
+def scan_network_with_custom_cidr_scans_only_that_range():
+    arp_calls, verify_calls = [], []
+    with patched(sc, **scanner_env(arp_calls, verify_calls)):
+        r = sc.scan_network(KNOWN, " 10.0.20.7/24 ")
+    assert arp_calls == [("arp-scan", "eno1", "10.0.20.0/24")]                    # validated + normalised target
+    assert r.custom is True and r.network == "10.0.20.0/24"
+    assert [h.ip for h in r.hosts] == ["10.0.20.1"]                               # own IP is filtered out of the sweep
+    assert verify_calls == [("10.0.20.9", "aa:00:00:00:20:09")]                   # only in-range silent devices re-checked
+    assert r.gateway_ip == "192.168.0.1" and r.interface == "eno1"
+    assert r.self_host and r.self_host.ip == "192.168.0.23"
+
+
+@test
+def scan_network_without_cidr_is_unchanged():
+    for cidr in (None, "", "   "):
+        arp_calls, verify_calls = [], []
+        with patched(sc, **scanner_env(arp_calls, verify_calls)):
+            r = sc.scan_network(KNOWN, cidr)
+        assert arp_calls == [("arp-scan", "eno1", None)]
+        assert r.custom is False and r.network == "192.168.0.0/24"
+        assert verify_calls == [("192.168.0.50", "aa:00:00:00:00:50")]            # custom-range devices are skipped here
+    with patched(sc, **scanner_env([], [])):
+        assert sc.scan_network(KNOWN).custom is False                             # old call style still works
+
+
+@test
+def scan_network_rejects_bad_cidr_before_running_arp_scan():
+    for bad in ("--file=/etc/passwd", "10.0.0.0/8", "nonsense", "10.0.20.0/24 10.0.21.0/24"):
+        arp_calls, verify_calls = [], []
+        with patched(sc, **scanner_env(arp_calls, verify_calls)):
+            try:
+                sc.scan_network(KNOWN, bad)
+            except sc.ScanError as e:
+                assert str(e).startswith("Custom scan range:"), str(e)
+            else:
+                raise AssertionError(f"scanned with {bad!r}")
+        assert arp_calls == [] and verify_calls == [], bad                         # nothing was executed
+
+
+@test
+def settings_custom_cidr_key():
+    db, s = fresh()
+    assert "custom_cidr" in DEFAULTS and s.get("custom_cidr") == ""
+    s.set("custom_cidr", "10.0.20.0/24")
+    assert db.get_meta("custom_cidr") == "10.0.20.0/24"                           # stored under exactly this key
+    assert Settings(db).get("custom_cidr") == "10.0.20.0/24"                      # survives a restart
+    s.set("custom_cidr", "")
+    assert Settings(db).get("custom_cidr") == "" and db.get_meta("custom_cidr") == ""
+
+
+@test
+def ip_in_network_helper():
+    f = H["ip_in_network"]
+    assert f("10.0.20.9", "10.0.20.0/24") and f("10.0.20.0", "10.0.20.0/24") and f("10.0.20.255", "10.0.20.0/24")
+    assert not f("10.0.21.1", "10.0.20.0/24") and not f("192.168.0.5", "10.0.20.0/24")
+    assert f("10.0.20.5", "10.0.20.5/32") and not f("10.0.20.6", "10.0.20.5/32")
+    assert not f(None, "10.0.20.0/24") and not f("garbage", "10.0.20.0/24") and not f("10.0.20.9", "garbage")
+    assert not f("::1", "10.0.20.0/24")
+
+
+@test
+def ui_passes_custom_cidr_from_settings_through_scanthread_to_scan_network():
+    src = (Path(__file__).resolve().parent.parent / "npg" / "ui.py").read_text()
+    tree = ast.parse(src)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ScanThread")
+    init = next(f for f in cls.body if isinstance(f, ast.FunctionDef) and f.name == "__init__")
+    assert [a.arg for a in init.args.args] == ["self", "known", "cidr"]
+    run = next(f for f in cls.body if isinstance(f, ast.FunctionDef) and f.name == "run")
+    calls = [n for n in ast.walk(run) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "scan_network"]
+    assert len(calls) == 1 and [ast.unparse(a) for a in calls[0].args] == ["self.known", "self.cidr"]
+    assert 'ScanThread(known, self.settings.get("custom_cidr"))' in src            # MainWindow.start_scan
+    assert "parse_cidr(self.cidr_edit.text())" in src                              # dialog validates before saving
+    assert src.count("setAutoDefault(False)") == 2                                 # Enter in the field presses no button
 
 
 
