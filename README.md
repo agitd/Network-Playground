@@ -27,6 +27,8 @@ A local network monitor for Linux. Scans your LAN, tracks devices over time, and
 - This allows scanning specific VLANs or multiple subnets available on the same physical interface.
 - **Security:** Strict IPv4 validation prevents option injection (e.g., `--file=/etc/passwd`) and size limits (max `/20`) prevent endless sweeps.
 - The status bar now indicates when a custom range is being scanned.
+- **Custom device names and tags** — rename devices and group them with tags; scans never overwrite your edits
+- **Built-in port scanner** — check 19 common TCP ports to identify devices (printers, cameras, PCs); non-blocking
 
 ## Requirements
 
@@ -81,7 +83,8 @@ bash install-network-playground.sh --uninstall --purge
 - **ONLINE / OFFLINE / NEW 24H** — filter the device list. ONLINE and OFFLINE are mutually exclusive; NEW 24H combines with either.
 - **EXPORT** — save the device list (as currently filtered) or the full event history to CSV or JSON.
 - **Map** — drag nodes, scroll to zoom, drag the background to pan, double-click the background to fit everything. Click a node to select it in the list and details panel. Dragged positions are saved.
-
+- **Names and Tags** — select a device, edit the NAME and TAGS fields in the details panel, and press Enter. Names are used on the map, in the list, in events, and in notifications.
+- **SCAN PORTS** — click this button in the details panel to check common TCP ports on the selected device. Results appear in the PORTS row.
 ## If your phone or other devices are missing
 
 Being on a LAN cable is fine for ARP — the router bridges wired and Wi-Fi onto the same network. If a device doesn't show up, it's usually one of three things:
