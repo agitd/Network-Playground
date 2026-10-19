@@ -114,3 +114,5 @@ The device database and saved map layout live in the same folder.
 ## License
 
 MIT
+
+Looking for a deep security audit? Check out my other project Sentinel Ultimate
